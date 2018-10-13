@@ -56,6 +56,7 @@ module Database.Esqueleto.Internal.Sql
   , parens
   , toArgList
   , builderToText
+  , over
   ) where
 
 import Control.Arrow ((***), first)
@@ -1827,3 +1828,14 @@ insertSelect = void . insertSelectCount
 insertSelectCount :: (MonadIO m, PersistEntity a) =>
   SqlQuery (SqlExpr (Insertion a)) -> SqlWriteT m Int64
 insertSelectCount = rawEsqueleto INSERT_INTO . fmap EInsertFinal
+
+over :: SqlExpr (Value a) -- (WindowType a))
+     -> Maybe (SqlExpr (Value b))
+     -> [SqlExpr OrderBy]
+     -> SqlExpr (Value a)
+over valE partitionM orders = ERaw Never $ \info ->
+    let ( vS, vals) = (\(ERaw _ f) -> f info) valE in
+    let ( pS, vals') = maybe (mempty, mempty) (first ("PARTITION BY " <>) . (\(ERaw _ f) -> f info)) partitionM in
+    let ( oS, vals'') = makeOrderBy info orders in
+
+    (vS <> " OVER " <> parens (pS <> oS), vals <> vals' <> vals'')

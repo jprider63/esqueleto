@@ -98,6 +98,7 @@ module Database.Esqueleto
     -- * Re-exports
     -- $reexports
   , deleteKey
+  , over
   , module Database.Esqueleto.Internal.PersistentImport
   ) where
 
