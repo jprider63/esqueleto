@@ -14,7 +14,9 @@
 module Database.Esqueleto.Internal.Language
   ( -- * The pretty face
     Esqueleto(..)
+  -- , select_subquery
   , from
+  -- , fromSubSelect
   , Value(..)
   , ValueList(..)
   , SomeValue(..)
@@ -37,6 +39,7 @@ module Database.Esqueleto.Internal.Language
   , IsJoinKind(..)
   , BackendCompatible(..)
   , PreprocessedFrom
+  , PreprocessedFromSelect
   , From
   , FromPreprocess
   , when_
@@ -89,6 +92,9 @@ class (Functor query, Applicative query, Monad query) =>
   fromFinish
     :: expr (PreprocessedFrom a)
     -> query a
+
+  -- a, b needs to have a From instance?
+  fromSubSelectStart :: query a -> (a -> query b) -> query (expr (PreprocessedFromSelect (expr b))) -- (expr b) -- query (expr (PreprocessedFrom (expr b)))
 
   -- | @WHERE@ clause: restrict the query's result.
   where_ :: expr (Value Bool) -> query ()
@@ -759,6 +765,8 @@ data JoinKind =
   | FullOuterJoinKind  -- ^ @FULL OUTER JOIN@
     deriving Eq
 
+-- | Data type that represents a subquery.
+data Subquery a = Subquery a
 
 -- | (Internal) Functions that operate on types (that should be)
 -- of kind 'JoinKind'.
@@ -796,6 +804,7 @@ instance Exception OnClauseWithoutMatchingJoinException where
 -- | (Internal) Phantom type used to process 'from' (see 'fromStart').
 data PreprocessedFrom a
 
+data PreprocessedFromSelect a
 
 -- | Phantom type used by 'orderBy', 'asc' and 'desc'.
 data OrderBy
@@ -942,11 +951,34 @@ class ToBaseId ent where
 from :: From query expr backend a => (a -> query b) -> query b
 from = (from_ >>=)
 
+-- fromSubSelect :: From query expr backend a => query a -> (a -> query b) -> query b
+-- fromSubSelect sub = undefined
+--     -- Get SQL from sub query.
+--     -- Insert into select statement, built from current query.
+
+-- from_subselect :: (From query expr backend a, From query expr backend b) => (a -> query b) -> (b -> query c) -> query c
+-- from_subselect = undefined
+
+-- select_subquery :: (From query expr backend b) => query b -> (b -> query c) -> query c
+-- -- select_subquery = (>>=)
+-- 
+-- select_subquery m f = do
+--     q <- m
+-- 
+-- 
+--     (from_ >>= f)
+
+
 
 -- | (Internal) Class that implements the tuple 'from' magic (see
 -- 'fromStart').
 class Esqueleto query expr backend => From query expr backend a where
   from_ :: query a
+
+instance ( Esqueleto query expr backend
+         -- , FromPreprocess query expr backend (expr (Value val))
+         ) => From query expr backend (expr (Value val)) where
+  from_ = undefined -- fromPreprocess >>= fromFinish
 
 instance ( Esqueleto query expr backend
          , FromPreprocess query expr backend (expr (Entity val))

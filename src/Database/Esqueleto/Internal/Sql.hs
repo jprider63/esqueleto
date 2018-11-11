@@ -21,6 +21,7 @@ module Database.Esqueleto.Internal.Sql
   , SqlExpr(..)
   , SqlEntity
   , select
+  , fromSubSelect
   , selectSource
   , delete
   , deleteCount
@@ -193,6 +194,11 @@ data FromClause =
     FromStart Ident EntityDef
   | FromJoin FromClause JoinKind FromClause (Maybe (SqlExpr (Value Bool)))
   | OnClause (SqlExpr (Value Bool))
+  -- | SubQuery Ident SideData -- Alias?
+  | SubQuery Ident (IdentInfo -> (TLB.Builder, [PersistValue]))
+
+-- data FromSubClause a = 
+--     SubQuery Ident (SqlQuery a) -- SideData -- Alias?
 
 
 -- | A part of a @SET@ clause.
@@ -295,7 +301,10 @@ initialIdentState = IdentState mempty
 -- | Create a fresh 'Ident'.  If possible, use the given
 -- 'DBName'.
 newIdentFor :: DBName -> SqlQuery Ident
-newIdentFor = Q . lift . try . unDBName
+newIdentFor = newIdent . unDBName
+
+newIdent :: T.Text -> SqlQuery Ident
+newIdent = Q . lift . try
   where
     try orig = do
       s <- S.get
@@ -331,7 +340,10 @@ useIdent info (I ident) = fromDBName info $ DBName ident
 -- data type.  However, Haddock doesn't like GADTs, so you'll have to read them by hitting \"Source\".
 data SqlExpr a where
   -- An entity, created by 'from' (cf. 'fromStart').
-  EEntity  :: Ident -> SqlExpr (Entity val)
+  -- EEntity  :: Ident -> SqlExpr (Entity val)
+  EEntity  :: Ident -> Maybe Ident -> SqlExpr (Entity val)
+
+  EValue :: Ident -> SqlExpr a
 
   -- Just a tag stating that something is nullable.
   EMaybe   :: SqlExpr a -> SqlExpr (Maybe a)
@@ -402,6 +414,8 @@ data SqlExpr a where
   -- An internal 'SqlExpr' used by the 'from' hack.
   EPreprocessedFrom :: a -> FromClause -> SqlExpr (PreprocessedFrom a)
 
+  EPreprocessedFromSelect :: Ident -> (SqlQuery a) -> (a -> SqlQuery b) -> SqlExpr (PreprocessedFromSelect (SqlExpr b)) -- (FromSelect a)
+
   -- Used by 'insertSelect'.
   EInsert  :: Proxy a -> (IdentInfo -> (TLB.Builder, [PersistValue])) -> SqlExpr (Insertion a)
   EInsertFinal :: PersistEntity a => SqlExpr (Insertion a) -> SqlExpr InsertFinal
@@ -419,6 +433,20 @@ data OrderByType = ASC | DESC
 
 
 instance Esqueleto SqlQuery SqlExpr SqlBackend where
+  -- fromSubSelectStart sub f = x
+  --   where
+  --       x = do
+  --           ident <- newIdent "sub"
+  --           return $ EPreprocessedFromSelect ident sub f
+        -- x = do
+        --     ident <- newIdent "c"
+        --     subIdent <- newIdent "sub"
+        --     let ret = EValue ident
+        --         from_ = SubQuery subIdent $ \info -> toRawSql SELECT info sub -- ERaw?
+
+
+        --     return (EPreprocessedFrom ret from_)
+
   fromStart = x
     where
       x = do
@@ -481,7 +509,7 @@ instance Esqueleto SqlQuery SqlExpr SqlBackend where
       toDistinctOn EOrderRandom =
         error "We can't select distinct by a random order!"
 
-  sub_select         = sub SELECT
+  sub_select         = sub (SELECT False)
 
   (^.) :: forall val typ. (PersistEntity val, PersistField typ)
        => SqlExpr (Entity val) -> EntityField val typ -> SqlExpr (Value typ)
@@ -618,7 +646,7 @@ fromDBName :: IdentInfo -> DBName -> TLB.Builder
 fromDBName (conn, _) = TLB.fromText . connEscapeName conn
 
 existsHelper :: SqlQuery () -> SqlExpr (Value Bool)
-existsHelper = sub SELECT . (>> return true)
+existsHelper = sub (SELECT False) . (>> return true)
   where
     true :: SqlExpr (Value Bool)
     true = val True
@@ -836,10 +864,13 @@ rawSelectSource mode query =
         return $ (C..| massage) `fmap` res
     where
 
-      run conn =
-        uncurry rawQueryRes $
-        first builderToText $
-        toRawSql mode (conn, initialIdentState) query
+      run conn = do
+        let r = first builderToText $
+                toRawSql mode (conn, initialIdentState) query
+
+        -- TODO: Remove me XXX
+        liftIO $ putStrLn $ T.unpack $ fst r
+        uncurry rawQueryRes $ r
 
       massage = do
         mrow <- C.await
@@ -862,7 +893,7 @@ selectSource :: ( SqlSelect a r
              => SqlQuery a
              -> C.ConduitT () r (R.ReaderT backend m) ()
 selectSource query = do
-  res <- lift $ rawSelectSource SELECT query
+  res <- lift $ rawSelectSource (SELECT False) query
   (key, src) <- lift $ allocateAcquire res
   src
   lift $ release key
@@ -913,7 +944,7 @@ select :: ( SqlSelect a r
           )
        => SqlQuery a -> SqlReadT m [r]
 select query = do
-    res <- rawSelectSource SELECT query
+    res <- rawSelectSource (SELECT False) query
     conn <- R.ask
     liftIO $ with res $ flip R.runReaderT conn . runSource
 
@@ -1035,7 +1066,17 @@ toRawSql mode (conn, firstIdentState) query =
         flip S.runState firstIdentState $
         W.runWriterT $
         unQ query
-      SideData distinctClause
+      -- Pass the finalIdentState (containing all identifiers
+      -- that were used) to the subsequent calls.  This ensures
+      -- that no name clashes will occur on subqueries that may
+      -- appear on the expressions below.
+      info = (projectBackend conn, finalIdentState)
+  in makeRawSql info mode ret sd
+
+-- This probably won't work? Do we need to update the monad transformer ident state?..
+makeRawSql info mode ret sd = 
+      let SideData 
+               distinctClause
                fromClauses
                setClauses
                whereClauses
@@ -1044,12 +1085,7 @@ toRawSql mode (conn, firstIdentState) query =
                orderByClauses
                limitClause
                lockingClause = sd
-      -- Pass the finalIdentState (containing all identifiers
-      -- that were used) to the subsequent calls.  This ensures
-      -- that no name clashes will occur on subqueries that may
-      -- appear on the expressions below.
-      info = (projectBackend conn, finalIdentState)
-  in mconcat
+    in mconcat
       [ makeInsertInto info mode ret
       , makeSelect     info mode distinctClause ret
       , makeFrom       info mode fromClauses
@@ -1065,7 +1101,7 @@ toRawSql mode (conn, firstIdentState) query =
 
 -- | (Internal) Mode of query being converted by 'toRawSql'.
 data Mode =
-    SELECT
+    SELECT {modeIsSubquery :: Bool}
   | DELETE
   | UPDATE
   | INSERT_INTO
@@ -1091,10 +1127,10 @@ makeSelect info mode_ distinctClause ret = process mode_
   where
     process mode =
       case mode of
-        SELECT      -> withCols selectKind
-        DELETE      -> plain "DELETE "
-        UPDATE      -> plain "UPDATE "
-        INSERT_INTO -> process SELECT
+        (SELECT subquery) -> withCols selectKind subquery
+        DELETE            -> plain "DELETE "
+        UPDATE            -> plain "UPDATE "
+        INSERT_INTO       -> process $ SELECT False
     selectKind =
       case distinctClause of
         DistinctAll      -> ("SELECT ", [])
@@ -1102,7 +1138,7 @@ makeSelect info mode_ distinctClause ret = process mode_
         DistinctOn exprs -> first (("SELECT DISTINCT ON (" <>) . (<> ") ")) $
                             uncommas' (processExpr <$> exprs)
       where processExpr (EDistinctOn f) = materializeExpr info f
-    withCols v = v <> sqlSelectCols info ret
+    withCols v subquery = v <> sqlSelectCols subquery info ret
     plain    v = (v, [])
 
 
@@ -1126,6 +1162,13 @@ makeFrom info mode fs = ret
               , maybe mempty makeOnClause monClause
               ]
     mk _ (OnClause _) = throw (UnexpectedCaseErr MakeFromError)
+    mk _ (SubQuery ident subquery) = 
+        first (\x -> parensM Parens x <> " AS " <> useIdent info ident) $
+        subquery info
+        -- makeRawSql SELECT info subquery
+        -- mempty -- TODO XXX
+
+
 
     base ident@(I identText) def =
       let db@(DBName dbText) = entityDB def
@@ -1236,7 +1279,7 @@ class SqlSelect a r | a -> r, r -> a where
   -- | Creates the variable part of the @SELECT@ query and
   -- returns the list of 'PersistValue's that will be given to
   -- 'rawQuery'.
-  sqlSelectCols :: IdentInfo -> a -> (TLB.Builder, [PersistValue])
+  sqlSelectCols :: Bool -> IdentInfo -> a -> (TLB.Builder, [PersistValue])
 
   -- | Number of columns that will be consumed.
   sqlSelectColCount :: Proxy a -> Int
@@ -1258,7 +1301,7 @@ instance SqlSelect (SqlExpr InsertFinal) InsertFinal where
                  entityDef p
         table  = fromDBName info . entityDB . entityDef $ p
     in ("INSERT INTO " <> table <> parens fields <> "\n", [])
-  sqlSelectCols info (EInsertFinal (EInsert _ f)) = f info
+  sqlSelectCols _ info (EInsertFinal (EInsert _ f)) = f info
   sqlSelectColCount   = const 0
   sqlSelectProcessRow =
     const (Right (throw (UnexpectedCaseErr InsertionFinalError)))
@@ -1266,17 +1309,17 @@ instance SqlSelect (SqlExpr InsertFinal) InsertFinal where
 
 -- | Not useful for 'select', but used for 'update' and 'delete'.
 instance SqlSelect () () where
-  sqlSelectCols _ _ = ("1", [])
+  sqlSelectCols _ _ _ = ("1", [])
   sqlSelectColCount _ = 1
   sqlSelectProcessRow _ = Right ()
 
 
 -- | You may return an 'Entity' from a 'select' query.
 instance PersistEntity a => SqlSelect (SqlExpr (Entity a)) (Entity a) where
-  sqlSelectCols info expr@(EEntity ident) = ret
+  sqlSelectCols subquery info expr@(EEntity ident _TODO) = ret
       where
         process ed = uncommas $
-                     map ((name <>) . TLB.fromText) $
+                     map ((\f -> name <> f <> alias f) . TLB.fromText) $
                      entityColumnNames ed (fst info)
         -- 'name' is the biggest difference between 'RawSql' and
         -- 'SqlSelect'.  We automatically create names for tables
@@ -1284,7 +1327,13 @@ instance PersistEntity a => SqlSelect (SqlExpr (Entity a)) (Entity a) where
         -- clause), while 'rawSql' assumes that it's just the
         -- name of the table (which doesn't allow self-joins, for
         -- example).
-        name = useIdent info ident <> "."
+        alias f = if subquery then
+                -- TODO: Better names + cleaner XXX
+                " AS " <> fromDBName info (DBName $ TL.toStrict $ TLB.toLazyText $ name' <> "_" <> f)
+            else
+                mempty
+        name' = useIdent info ident
+        name = name' <> "."
         ret = let ed = entityDef $ getEntityVal $ return expr
               in (process ed, mempty)
   sqlSelectColCount = entityColumnCount . entityDef . getEntityVal
@@ -1297,7 +1346,7 @@ getEntityVal = const Proxy
 
 -- | You may return a possibly-@NULL@ 'Entity' from a 'select' query.
 instance PersistEntity a => SqlSelect (SqlExpr (Maybe (Entity a))) (Maybe (Entity a)) where
-  sqlSelectCols info (EMaybe ent) = sqlSelectCols info ent
+  sqlSelectCols subquery info (EMaybe ent) = sqlSelectCols subquery info ent
   sqlSelectColCount = sqlSelectColCount . fromEMaybe
     where
       fromEMaybe :: Proxy (SqlExpr (Maybe e)) -> Proxy (SqlExpr e)
@@ -1310,7 +1359,7 @@ instance PersistEntity a => SqlSelect (SqlExpr (Maybe (Entity a))) (Maybe (Entit
 -- | You may return any single value (i.e. a single column) from
 -- a 'select' query.
 instance PersistField a => SqlSelect (SqlExpr (Value a)) (Value a) where
-  sqlSelectCols = materializeExpr
+  sqlSelectCols _ = materializeExpr
   sqlSelectColCount = const 1
   sqlSelectProcessRow [pv] = Value <$> fromPersistValue pv
   sqlSelectProcessRow pvs  = Value <$> fromPersistValue (PersistList pvs)
@@ -1331,10 +1380,10 @@ materializeExpr info (ECompositeKey f) =
 instance ( SqlSelect a ra
          , SqlSelect b rb
          ) => SqlSelect (a, b) (ra, rb) where
-  sqlSelectCols esc (a, b) =
+  sqlSelectCols subquery esc (a, b) =
     uncommas'
-      [ sqlSelectCols esc a
-      , sqlSelectCols esc b
+      [ sqlSelectCols subquery esc a
+      , sqlSelectCols subquery esc b
       ]
   sqlSelectColCount = uncurry (+) . (sqlSelectColCount *** sqlSelectColCount) . fromTuple
     where
@@ -1360,11 +1409,11 @@ instance ( SqlSelect a ra
          , SqlSelect b rb
          , SqlSelect c rc
          ) => SqlSelect (a, b, c) (ra, rb, rc) where
-  sqlSelectCols esc (a, b, c) =
+  sqlSelectCols subquery esc (a, b, c) =
     uncommas'
-      [ sqlSelectCols esc a
-      , sqlSelectCols esc b
-      , sqlSelectCols esc c
+      [ sqlSelectCols subquery esc a
+      , sqlSelectCols subquery esc b
+      , sqlSelectCols subquery esc c
       ]
   sqlSelectColCount   = sqlSelectColCount . from3P
   sqlSelectProcessRow = fmap to3 . sqlSelectProcessRow
@@ -1384,12 +1433,12 @@ instance ( SqlSelect a ra
          , SqlSelect c rc
          , SqlSelect d rd
          ) => SqlSelect (a, b, c, d) (ra, rb, rc, rd) where
-  sqlSelectCols esc (a, b, c, d) =
+  sqlSelectCols subquery esc (a, b, c, d) =
     uncommas'
-      [ sqlSelectCols esc a
-      , sqlSelectCols esc b
-      , sqlSelectCols esc c
-      , sqlSelectCols esc d
+      [ sqlSelectCols subquery esc a
+      , sqlSelectCols subquery esc b
+      , sqlSelectCols subquery esc c
+      , sqlSelectCols subquery esc d
       ]
   sqlSelectColCount   = sqlSelectColCount . from4P
   sqlSelectProcessRow = fmap to4 . sqlSelectProcessRow
@@ -1410,13 +1459,13 @@ instance ( SqlSelect a ra
          , SqlSelect d rd
          , SqlSelect e re
          ) => SqlSelect (a, b, c, d, e) (ra, rb, rc, rd, re) where
-  sqlSelectCols esc (a, b, c, d, e) =
+  sqlSelectCols subquery esc (a, b, c, d, e) =
     uncommas'
-      [ sqlSelectCols esc a
-      , sqlSelectCols esc b
-      , sqlSelectCols esc c
-      , sqlSelectCols esc d
-      , sqlSelectCols esc e
+      [ sqlSelectCols subquery esc a
+      , sqlSelectCols subquery esc b
+      , sqlSelectCols subquery esc c
+      , sqlSelectCols subquery esc d
+      , sqlSelectCols subquery esc e
       ]
   sqlSelectColCount   = sqlSelectColCount . from5P
   sqlSelectProcessRow = fmap to5 . sqlSelectProcessRow
@@ -1435,14 +1484,14 @@ instance ( SqlSelect a ra
          , SqlSelect e re
          , SqlSelect f rf
          ) => SqlSelect (a, b, c, d, e, f) (ra, rb, rc, rd, re, rf) where
-  sqlSelectCols esc (a, b, c, d, e, f) =
+  sqlSelectCols subquery esc (a, b, c, d, e, f) =
     uncommas'
-      [ sqlSelectCols esc a
-      , sqlSelectCols esc b
-      , sqlSelectCols esc c
-      , sqlSelectCols esc d
-      , sqlSelectCols esc e
-      , sqlSelectCols esc f
+      [ sqlSelectCols subquery esc a
+      , sqlSelectCols subquery esc b
+      , sqlSelectCols subquery esc c
+      , sqlSelectCols subquery esc d
+      , sqlSelectCols subquery esc e
+      , sqlSelectCols subquery esc f
       ]
   sqlSelectColCount   = sqlSelectColCount . from6P
   sqlSelectProcessRow = fmap to6 . sqlSelectProcessRow
@@ -1462,15 +1511,15 @@ instance ( SqlSelect a ra
          , SqlSelect f rf
          , SqlSelect g rg
          ) => SqlSelect (a, b, c, d, e, f, g) (ra, rb, rc, rd, re, rf, rg) where
-  sqlSelectCols esc (a, b, c, d, e, f, g) =
+  sqlSelectCols subquery esc (a, b, c, d, e, f, g) =
     uncommas'
-      [ sqlSelectCols esc a
-      , sqlSelectCols esc b
-      , sqlSelectCols esc c
-      , sqlSelectCols esc d
-      , sqlSelectCols esc e
-      , sqlSelectCols esc f
-      , sqlSelectCols esc g
+      [ sqlSelectCols subquery esc a
+      , sqlSelectCols subquery esc b
+      , sqlSelectCols subquery esc c
+      , sqlSelectCols subquery esc d
+      , sqlSelectCols subquery esc e
+      , sqlSelectCols subquery esc f
+      , sqlSelectCols subquery esc g
       ]
   sqlSelectColCount   = sqlSelectColCount . from7P
   sqlSelectProcessRow = fmap to7 . sqlSelectProcessRow
@@ -1491,16 +1540,16 @@ instance ( SqlSelect a ra
          , SqlSelect g rg
          , SqlSelect h rh
          ) => SqlSelect (a, b, c, d, e, f, g, h) (ra, rb, rc, rd, re, rf, rg, rh) where
-  sqlSelectCols esc (a, b, c, d, e, f, g, h) =
+  sqlSelectCols subquery esc (a, b, c, d, e, f, g, h) =
     uncommas'
-      [ sqlSelectCols esc a
-      , sqlSelectCols esc b
-      , sqlSelectCols esc c
-      , sqlSelectCols esc d
-      , sqlSelectCols esc e
-      , sqlSelectCols esc f
-      , sqlSelectCols esc g
-      , sqlSelectCols esc h
+      [ sqlSelectCols subquery esc a
+      , sqlSelectCols subquery esc b
+      , sqlSelectCols subquery esc c
+      , sqlSelectCols subquery esc d
+      , sqlSelectCols subquery esc e
+      , sqlSelectCols subquery esc f
+      , sqlSelectCols subquery esc g
+      , sqlSelectCols subquery esc h
       ]
   sqlSelectColCount   = sqlSelectColCount . from8P
   sqlSelectProcessRow = fmap to8 . sqlSelectProcessRow
@@ -1521,17 +1570,17 @@ instance ( SqlSelect a ra
          , SqlSelect h rh
          , SqlSelect i ri
          ) => SqlSelect (a, b, c, d, e, f, g, h, i) (ra, rb, rc, rd, re, rf, rg, rh, ri) where
-  sqlSelectCols esc (a, b, c, d, e, f, g, h, i) =
+  sqlSelectCols subquery esc (a, b, c, d, e, f, g, h, i) =
     uncommas'
-      [ sqlSelectCols esc a
-      , sqlSelectCols esc b
-      , sqlSelectCols esc c
-      , sqlSelectCols esc d
-      , sqlSelectCols esc e
-      , sqlSelectCols esc f
-      , sqlSelectCols esc g
-      , sqlSelectCols esc h
-      , sqlSelectCols esc i
+      [ sqlSelectCols subquery esc a
+      , sqlSelectCols subquery esc b
+      , sqlSelectCols subquery esc c
+      , sqlSelectCols subquery esc d
+      , sqlSelectCols subquery esc e
+      , sqlSelectCols subquery esc f
+      , sqlSelectCols subquery esc g
+      , sqlSelectCols subquery esc h
+      , sqlSelectCols subquery esc i
       ]
   sqlSelectColCount   = sqlSelectColCount . from9P
   sqlSelectProcessRow = fmap to9 . sqlSelectProcessRow
@@ -1553,18 +1602,18 @@ instance ( SqlSelect a ra
          , SqlSelect i ri
          , SqlSelect j rj
          ) => SqlSelect (a, b, c, d, e, f, g, h, i, j) (ra, rb, rc, rd, re, rf, rg, rh, ri, rj) where
-  sqlSelectCols esc (a, b, c, d, e, f, g, h, i, j) =
+  sqlSelectCols subquery esc (a, b, c, d, e, f, g, h, i, j) =
     uncommas'
-      [ sqlSelectCols esc a
-      , sqlSelectCols esc b
-      , sqlSelectCols esc c
-      , sqlSelectCols esc d
-      , sqlSelectCols esc e
-      , sqlSelectCols esc f
-      , sqlSelectCols esc g
-      , sqlSelectCols esc h
-      , sqlSelectCols esc i
-      , sqlSelectCols esc j
+      [ sqlSelectCols subquery esc a
+      , sqlSelectCols subquery esc b
+      , sqlSelectCols subquery esc c
+      , sqlSelectCols subquery esc d
+      , sqlSelectCols subquery esc e
+      , sqlSelectCols subquery esc f
+      , sqlSelectCols subquery esc g
+      , sqlSelectCols subquery esc h
+      , sqlSelectCols subquery esc i
+      , sqlSelectCols subquery esc j
       ]
   sqlSelectColCount   = sqlSelectColCount . from10P
   sqlSelectProcessRow = fmap to10 . sqlSelectProcessRow
@@ -1588,19 +1637,19 @@ instance ( SqlSelect a ra
          , SqlSelect j rj
          , SqlSelect k rk
          ) => SqlSelect (a, b, c, d, e, f, g, h, i, j, k) (ra, rb, rc, rd, re, rf, rg, rh, ri, rj, rk) where
-  sqlSelectCols esc (a, b, c, d, e, f, g, h, i, j, k) =
+  sqlSelectCols subquery esc (a, b, c, d, e, f, g, h, i, j, k) =
     uncommas'
-      [ sqlSelectCols esc a
-      , sqlSelectCols esc b
-      , sqlSelectCols esc c
-      , sqlSelectCols esc d
-      , sqlSelectCols esc e
-      , sqlSelectCols esc f
-      , sqlSelectCols esc g
-      , sqlSelectCols esc h
-      , sqlSelectCols esc i
-      , sqlSelectCols esc j
-      , sqlSelectCols esc k
+      [ sqlSelectCols subquery esc a
+      , sqlSelectCols subquery esc b
+      , sqlSelectCols subquery esc c
+      , sqlSelectCols subquery esc d
+      , sqlSelectCols subquery esc e
+      , sqlSelectCols subquery esc f
+      , sqlSelectCols subquery esc g
+      , sqlSelectCols subquery esc h
+      , sqlSelectCols subquery esc i
+      , sqlSelectCols subquery esc j
+      , sqlSelectCols subquery esc k
       ]
   sqlSelectColCount   = sqlSelectColCount . from11P
   sqlSelectProcessRow = fmap to11 . sqlSelectProcessRow
@@ -1624,20 +1673,20 @@ instance ( SqlSelect a ra
          , SqlSelect k rk
          , SqlSelect l rl
          ) => SqlSelect (a, b, c, d, e, f, g, h, i, j, k, l) (ra, rb, rc, rd, re, rf, rg, rh, ri, rj, rk, rl) where
-  sqlSelectCols esc (a, b, c, d, e, f, g, h, i, j, k, l) =
+  sqlSelectCols subquery esc (a, b, c, d, e, f, g, h, i, j, k, l) =
     uncommas'
-      [ sqlSelectCols esc a
-      , sqlSelectCols esc b
-      , sqlSelectCols esc c
-      , sqlSelectCols esc d
-      , sqlSelectCols esc e
-      , sqlSelectCols esc f
-      , sqlSelectCols esc g
-      , sqlSelectCols esc h
-      , sqlSelectCols esc i
-      , sqlSelectCols esc j
-      , sqlSelectCols esc k
-      , sqlSelectCols esc l
+      [ sqlSelectCols subquery esc a
+      , sqlSelectCols subquery esc b
+      , sqlSelectCols subquery esc c
+      , sqlSelectCols subquery esc d
+      , sqlSelectCols subquery esc e
+      , sqlSelectCols subquery esc f
+      , sqlSelectCols subquery esc g
+      , sqlSelectCols subquery esc h
+      , sqlSelectCols subquery esc i
+      , sqlSelectCols subquery esc j
+      , sqlSelectCols subquery esc k
+      , sqlSelectCols subquery esc l
       ]
   sqlSelectColCount   = sqlSelectColCount . from12P
   sqlSelectProcessRow = fmap to12 . sqlSelectProcessRow
@@ -1662,21 +1711,21 @@ instance ( SqlSelect a ra
          , SqlSelect l rl
          , SqlSelect m rm
          ) => SqlSelect (a, b, c, d, e, f, g, h, i, j, k, l, m) (ra, rb, rc, rd, re, rf, rg, rh, ri, rj, rk, rl, rm) where
-  sqlSelectCols esc (a, b, c, d, e, f, g, h, i, j, k, l, m) =
+  sqlSelectCols subquery esc (a, b, c, d, e, f, g, h, i, j, k, l, m) =
     uncommas'
-      [ sqlSelectCols esc a
-      , sqlSelectCols esc b
-      , sqlSelectCols esc c
-      , sqlSelectCols esc d
-      , sqlSelectCols esc e
-      , sqlSelectCols esc f
-      , sqlSelectCols esc g
-      , sqlSelectCols esc h
-      , sqlSelectCols esc i
-      , sqlSelectCols esc j
-      , sqlSelectCols esc k
-      , sqlSelectCols esc l
-      , sqlSelectCols esc m
+      [ sqlSelectCols subquery esc a
+      , sqlSelectCols subquery esc b
+      , sqlSelectCols subquery esc c
+      , sqlSelectCols subquery esc d
+      , sqlSelectCols subquery esc e
+      , sqlSelectCols subquery esc f
+      , sqlSelectCols subquery esc g
+      , sqlSelectCols subquery esc h
+      , sqlSelectCols subquery esc i
+      , sqlSelectCols subquery esc j
+      , sqlSelectCols subquery esc k
+      , sqlSelectCols subquery esc l
+      , sqlSelectCols subquery esc m
       ]
   sqlSelectColCount   = sqlSelectColCount . from13P
   sqlSelectProcessRow = fmap to13 . sqlSelectProcessRow
@@ -1702,22 +1751,22 @@ instance ( SqlSelect a ra
          , SqlSelect m rm
          , SqlSelect n rn
          ) => SqlSelect (a, b, c, d, e, f, g, h, i, j, k, l, m, n) (ra, rb, rc, rd, re, rf, rg, rh, ri, rj, rk, rl, rm, rn) where
-  sqlSelectCols esc (a, b, c, d, e, f, g, h, i, j, k, l, m, n) =
+  sqlSelectCols subquery esc (a, b, c, d, e, f, g, h, i, j, k, l, m, n) =
     uncommas'
-      [ sqlSelectCols esc a
-      , sqlSelectCols esc b
-      , sqlSelectCols esc c
-      , sqlSelectCols esc d
-      , sqlSelectCols esc e
-      , sqlSelectCols esc f
-      , sqlSelectCols esc g
-      , sqlSelectCols esc h
-      , sqlSelectCols esc i
-      , sqlSelectCols esc j
-      , sqlSelectCols esc k
-      , sqlSelectCols esc l
-      , sqlSelectCols esc m
-      , sqlSelectCols esc n
+      [ sqlSelectCols subquery esc a
+      , sqlSelectCols subquery esc b
+      , sqlSelectCols subquery esc c
+      , sqlSelectCols subquery esc d
+      , sqlSelectCols subquery esc e
+      , sqlSelectCols subquery esc f
+      , sqlSelectCols subquery esc g
+      , sqlSelectCols subquery esc h
+      , sqlSelectCols subquery esc i
+      , sqlSelectCols subquery esc j
+      , sqlSelectCols subquery esc k
+      , sqlSelectCols subquery esc l
+      , sqlSelectCols subquery esc m
+      , sqlSelectCols subquery esc n
       ]
   sqlSelectColCount   = sqlSelectColCount . from14P
   sqlSelectProcessRow = fmap to14 . sqlSelectProcessRow
@@ -1744,23 +1793,23 @@ instance ( SqlSelect a ra
          , SqlSelect n rn
          , SqlSelect o ro
          ) => SqlSelect (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) (ra, rb, rc, rd, re, rf, rg, rh, ri, rj, rk, rl, rm, rn, ro) where
-  sqlSelectCols esc (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) =
+  sqlSelectCols subquery esc (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) =
     uncommas'
-      [ sqlSelectCols esc a
-      , sqlSelectCols esc b
-      , sqlSelectCols esc c
-      , sqlSelectCols esc d
-      , sqlSelectCols esc e
-      , sqlSelectCols esc f
-      , sqlSelectCols esc g
-      , sqlSelectCols esc h
-      , sqlSelectCols esc i
-      , sqlSelectCols esc j
-      , sqlSelectCols esc k
-      , sqlSelectCols esc l
-      , sqlSelectCols esc m
-      , sqlSelectCols esc n
-      , sqlSelectCols esc o
+      [ sqlSelectCols subquery esc a
+      , sqlSelectCols subquery esc b
+      , sqlSelectCols subquery esc c
+      , sqlSelectCols subquery esc d
+      , sqlSelectCols subquery esc e
+      , sqlSelectCols subquery esc f
+      , sqlSelectCols subquery esc g
+      , sqlSelectCols subquery esc h
+      , sqlSelectCols subquery esc i
+      , sqlSelectCols subquery esc j
+      , sqlSelectCols subquery esc k
+      , sqlSelectCols subquery esc l
+      , sqlSelectCols subquery esc m
+      , sqlSelectCols subquery esc n
+      , sqlSelectCols subquery esc o
       ]
   sqlSelectColCount   = sqlSelectColCount . from15P
   sqlSelectProcessRow = fmap to15 . sqlSelectProcessRow
@@ -1788,24 +1837,24 @@ instance ( SqlSelect a ra
          , SqlSelect o ro
          , SqlSelect p rp
          ) => SqlSelect (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p) (ra, rb, rc, rd, re, rf, rg, rh, ri, rj, rk, rl, rm, rn, ro, rp) where
-  sqlSelectCols esc (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p) =
+  sqlSelectCols subquery esc (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p) =
     uncommas'
-      [ sqlSelectCols esc a
-      , sqlSelectCols esc b
-      , sqlSelectCols esc c
-      , sqlSelectCols esc d
-      , sqlSelectCols esc e
-      , sqlSelectCols esc f
-      , sqlSelectCols esc g
-      , sqlSelectCols esc h
-      , sqlSelectCols esc i
-      , sqlSelectCols esc j
-      , sqlSelectCols esc k
-      , sqlSelectCols esc l
-      , sqlSelectCols esc m
-      , sqlSelectCols esc n
-      , sqlSelectCols esc o
-      , sqlSelectCols esc p
+      [ sqlSelectCols subquery esc a
+      , sqlSelectCols subquery esc b
+      , sqlSelectCols subquery esc c
+      , sqlSelectCols subquery esc d
+      , sqlSelectCols subquery esc e
+      , sqlSelectCols subquery esc f
+      , sqlSelectCols subquery esc g
+      , sqlSelectCols subquery esc h
+      , sqlSelectCols subquery esc i
+      , sqlSelectCols subquery esc j
+      , sqlSelectCols subquery esc k
+      , sqlSelectCols subquery esc l
+      , sqlSelectCols subquery esc m
+      , sqlSelectCols subquery esc n
+      , sqlSelectCols subquery esc o
+      , sqlSelectCols subquery esc p
       ]
   sqlSelectColCount   = sqlSelectColCount . from16P
   sqlSelectProcessRow = fmap to16 . sqlSelectProcessRow
@@ -1839,3 +1888,50 @@ over valE partitionM orders = ERaw Never $ \info ->
     let ( oS, vals'') = makeOrderBy info orders in
 
     (vS <> " OVER " <> parens (pS <> oS), vals <> vals' <> vals'')
+
+-- (select x.a, x.c from (select a, b, c from ... ) as x where ...)
+-- -- from_subselect :: SqlQuery (SqlExpr a) -> (a -> SqlQuery (SqlExpr b)) -> (SqlQuery (SqlExpr b))
+-- from_subselect :: SqlQuery (SqlExpr a) -> (a -> SqlQuery (SqlExpr b)) -> (SqlQuery (SqlExpr b))
+-- from_subselect subquery f = x
+--     where
+--         x = undefined
+-- 
+--     let 
+-- 
+--     
+-- 
+-- 
+-- ERaw Parens $ \info -> 
+--     let r = toRawSql SELECT info subquery in
+--     r
+
+
+-- fromSubSelect :: From query expr backend a => query a -> (a -> query b) -> query b
+-- :: (SqlSelect a r, BackendCompatible SqlBackend backend)
+fromSubSelect :: (SqlSelect a r, From SqlQuery SqlExpr SqlBackend a) => SqlQuery a -> (a -> SqlQuery b) -> SqlQuery b
+fromSubSelect subquery f = do
+    -- Get SQL from sub query.
+    initialIdentState <- Q $ lift S.get
+    let ((ret, sd), finalIdentState) =
+          flip S.runState initialIdentState $
+          W.runWriterT $
+          unQ subquery
+    Q $ lift $ S.put finalIdentState
+    -- let (sql, vals) = toRawSql SELECT info sub
+
+    -- Insert into select statement, built from current query.
+    res <- f $ toSubExpr ret
+
+    -- TODO: How do we put sd into query?
+    subIdent <- newIdent "sub"
+    Q $ W.tell mempty { sdFromClause = [SubQuery subIdent (\info -> makeRawSql info (SELECT True) ret sd)]}
+    -- Q $ W.tell mempty { sd}
+
+    return res
+
+    where
+        -- toSubExpr x@(EValue _) = x
+        toSubExpr x = x
+
+
+    

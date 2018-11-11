@@ -58,6 +58,7 @@ module Database.Esqueleto
   , then_
   , else_
   , from
+  , fromSubSelect
   , Value(..)
   , ValueList(..)
   , OrderBy
