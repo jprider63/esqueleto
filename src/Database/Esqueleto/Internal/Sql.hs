@@ -340,8 +340,10 @@ useIdent info (I ident) = fromDBName info $ DBName ident
 -- data type.  However, Haddock doesn't like GADTs, so you'll have to read them by hitting \"Source\".
 data SqlExpr a where
   -- An entity, created by 'from' (cf. 'fromStart').
-  -- EEntity  :: Ident -> SqlExpr (Entity val)
-  EEntity  :: Ident -> Maybe Ident -> SqlExpr (Entity val)
+  EEntity  :: Ident -> SqlExpr (Entity val)
+  -- EEntity  :: Ident -> Maybe Ident -> SqlExpr (Entity val)
+  -- EAlias???
+  -- ESub??
 
   EValue :: Ident -> SqlExpr a
 
@@ -1316,7 +1318,7 @@ instance SqlSelect () () where
 
 -- | You may return an 'Entity' from a 'select' query.
 instance PersistEntity a => SqlSelect (SqlExpr (Entity a)) (Entity a) where
-  sqlSelectCols subquery info expr@(EEntity ident _TODO) = ret
+  sqlSelectCols subquery info expr@(EEntity ident) = ret
       where
         process ed = uncommas $
                      map ((\f -> name <> f <> alias f) . TLB.fromText) $
