@@ -26,7 +26,9 @@ module Database.Esqueleto.Internal.Language
   , LeftOuterJoin(..)
   , RightOuterJoin(..)
   , FullOuterJoin(..)
+  -- , As(..)
   , OnClauseWithoutMatchingJoinException(..)
+  , Alias
   , OrderBy
   , DistinctOn
   , Update
@@ -765,8 +767,9 @@ data JoinKind =
   | FullOuterJoinKind  -- ^ @FULL OUTER JOIN@
     deriving Eq
 
--- | Data type that represents a subquery.
-data Subquery a = Subquery a
+-- -- | Data type that represents an @AS@.
+-- data As a b = a `As` b
+-- data As a = As a
 
 -- | (Internal) Functions that operate on types (that should be)
 -- of kind 'JoinKind'.
@@ -809,6 +812,7 @@ data PreprocessedFromSelect a
 -- | Phantom type used by 'orderBy', 'asc' and 'desc'.
 data OrderBy
 
+data Alias a
 
 -- | Phantom type used by 'distinctOn' and 'don'.
 data DistinctOn
@@ -977,8 +981,10 @@ class Esqueleto query expr backend => From query expr backend a where
 
 instance ( Esqueleto query expr backend
          -- , FromPreprocess query expr backend (expr (Value val))
-         ) => From query expr backend (expr (Value val)) where
-  from_ = undefined -- fromPreprocess >>= fromFinish
+         ) => From query expr backend (expr (Alias (Value val))) where
+  from_ = error "from_ for Alias evaluated"
+    -- JP: We don't need this?
+    -- fromPreprocess >>= fromFinish
 
 instance ( Esqueleto query expr backend
          , FromPreprocess query expr backend (expr (Entity val))

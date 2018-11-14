@@ -62,6 +62,7 @@ module Database.Esqueleto
   , Value(..)
   , ValueList(..)
   , OrderBy
+  , Alias
   , DistinctOn
   , LockingKind(..)
   , SqlString
@@ -100,6 +101,8 @@ module Database.Esqueleto
     -- $reexports
   , deleteKey
   , over
+  , as
+  , fromAlias
   , module Database.Esqueleto.Internal.PersistentImport
   ) where
 

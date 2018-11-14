@@ -58,6 +58,8 @@ module Database.Esqueleto.Internal.Sql
   , toArgList
   , builderToText
   , over
+  , as
+  , fromAlias
   ) where
 
 import Control.Arrow ((***), first)
@@ -340,9 +342,13 @@ useIdent info (I ident) = fromDBName info $ DBName ident
 -- data type.  However, Haddock doesn't like GADTs, so you'll have to read them by hitting \"Source\".
 data SqlExpr a where
   -- An entity, created by 'from' (cf. 'fromStart').
-  EEntity  :: Ident -> SqlExpr (Entity val)
-  -- EEntity  :: Ident -> Maybe Ident -> SqlExpr (Entity val)
+  -- EEntity  :: Ident -> SqlExpr (Entity val)
+  EEntity  :: Maybe Ident -> Ident -> SqlExpr (Entity val)
+
+  EAlias :: Ident -> SqlExpr a -> SqlExpr (Alias a)
+  -- EAlias :: Ident -> Ident -> SqlExpr a
   -- EAlias???
+  ESub :: Ident -> Ident -> SqlExpr a
   -- ESub??
 
   EValue :: Ident -> SqlExpr a
@@ -431,6 +437,10 @@ parensM :: NeedParens -> TLB.Builder -> TLB.Builder
 parensM Never  = id
 parensM Parens = parens
 
+asM :: Bool -> TLB.Builder -> TLB.Builder -> TLB.Builder
+asM True  name = (<> " AS " <> name)
+asM False _    = id
+
 data OrderByType = ASC | DESC
 
 
@@ -454,7 +464,7 @@ instance Esqueleto SqlQuery SqlExpr SqlBackend where
       x = do
         let ed = entityDef (getVal x)
         ident <- newIdentFor (entityDB ed)
-        let ret   = EEntity ident
+        let ret   = EEntity Nothing ident
             from_ = FromStart ident ed
         return (EPreprocessedFrom ret from_)
       getVal :: SqlQuery (SqlExpr (PreprocessedFrom (SqlExpr (Entity a)))) -> Proxy a
@@ -515,12 +525,14 @@ instance Esqueleto SqlQuery SqlExpr SqlBackend where
 
   (^.) :: forall val typ. (PersistEntity val, PersistField typ)
        => SqlExpr (Entity val) -> EntityField val typ -> SqlExpr (Value typ)
-  EEntity ident ^. field
-    | isComposite = ECompositeKey $ \info ->  dot info <$> compositeFields pdef
-    | otherwise   = ERaw Never    $ \info -> (dot info  $  persistFieldDef field, [])
+  expr ^. field
+    -- | isComposite = ECompositeKey $ \info ->  dot info <$> compositeFields pdef
+    -- | otherwise   = ERaw Never    $ \info -> (dot info  $  persistFieldDef field, [])
+    | isComposite = ECompositeKey $ \info ->  entityFieldToIdents False info expr <$> compositeFields pdef
+    | otherwise   = ERaw Never    $ \info -> (entityFieldToIdents False info expr $ persistFieldDef field, [])
     where
       isComposite = isIdField field && hasCompositeKey ed
-      dot info x  = useIdent info ident <> "." <> fromDBName info (fieldDB x)
+      -- dot info x  = useIdent info ident <> "." <> fromDBName info (fieldDB x)
       ed          = entityDef $ getEntityVal (Proxy :: Proxy (SqlExpr (Entity val)))
       Just pdef   = entityPrimary ed
 
@@ -1089,7 +1101,7 @@ makeRawSql info mode ret sd =
                lockingClause = sd
     in mconcat
       [ makeInsertInto info mode ret
-      , makeSelect     info mode distinctClause ret
+      , makeSelect     info mode distinctClause ret -- JP: We need new idents for subquery aliases... 
       , makeFrom       info mode fromClauses
       , makeSet        info setClauses
       , makeWhere      info whereClauses
@@ -1129,17 +1141,17 @@ makeSelect info mode_ distinctClause ret = process mode_
   where
     process mode =
       case mode of
-        (SELECT subquery) -> withCols selectKind subquery
+        (SELECT subquery) -> withCols (selectKind subquery) subquery
         DELETE            -> plain "DELETE "
         UPDATE            -> plain "UPDATE "
         INSERT_INTO       -> process $ SELECT False
-    selectKind =
+    selectKind subquery =
       case distinctClause of
         DistinctAll      -> ("SELECT ", [])
         DistinctStandard -> ("SELECT DISTINCT ", [])
         DistinctOn exprs -> first (("SELECT DISTINCT ON (" <>) . (<> ") ")) $
                             uncommas' (processExpr <$> exprs)
-      where processExpr (EDistinctOn f) = materializeExpr info f
+      where processExpr (EDistinctOn f) = materializeExpr subquery info f
     withCols v subquery = v <> sqlSelectCols subquery info ret
     plain    v = (v, [])
 
@@ -1315,29 +1327,57 @@ instance SqlSelect () () where
   sqlSelectColCount _ = 1
   sqlSelectProcessRow _ = Right ()
 
+entityFieldToIdents :: Bool -> IdentInfo -> SqlExpr (Entity v) -> FieldDef -> TLB.Builder -- (Ident, Ident)
+entityFieldToIdents subquery info (EEntity subIdentM eIdent) f = case (subquery, subIdentM) of
+    (False, Nothing) -> efName
+    (True, Nothing) -> efName <> alias
+    (_, Just subIdent) -> useIdent info subIdent <> "." <> asEFName
+    where
+        efName = eName <> "." <> fName
+        eName = useIdent info eIdent
+        fDB = fieldDB f
+        fName = fromDBName info fDB
+
+        asEFName = 
+            let (I rawE) = eIdent in
+            let (DBName rawF) = fDB in
+            useIdent info $ I $ rawE <> "__" <> rawF
+
+        alias = " AS " <> asEFName
 
 -- | You may return an 'Entity' from a 'select' query.
 instance PersistEntity a => SqlSelect (SqlExpr (Entity a)) (Entity a) where
-  sqlSelectCols subquery info expr@(EEntity ident) = ret
+  sqlSelectCols subquery info expr = ret
       where
+        -- process ed = uncommas $
+        --              map ((\f -> name <> f <> alias f) . TLB.fromText) $
+        --              entityColumnNames ed (fst info)
         process ed = uncommas $
-                     map ((\f -> name <> f <> alias f) . TLB.fromText) $
-                     entityColumnNames ed (fst info)
+                     map (entityFieldToIdents subquery info expr) $
+                     keyAndEntityFields ed -- JP: Does this work with composite fields?
         -- 'name' is the biggest difference between 'RawSql' and
         -- 'SqlSelect'.  We automatically create names for tables
         -- (since it's not the user who's writing the FROM
         -- clause), while 'rawSql' assumes that it's just the
         -- name of the table (which doesn't allow self-joins, for
         -- example).
-        alias f = if subquery then
-                -- TODO: Better names + cleaner XXX
-                " AS " <> fromDBName info (DBName $ TL.toStrict $ TLB.toLazyText $ name' <> "_" <> f)
-            else
-                mempty
-        name' = useIdent info ident
-        name = name' <> "."
+        -- alias f = if subquery then
+        --         -- TODO: Better names + cleaner. Make sure the names are unique. XXX
+        --         " AS " <> fromDBName info (DBName $ TL.toStrict $ TLB.toLazyText $ name' <> "_" <> f)
+        --     else
+        --         mempty
+        -- name' = useIdent info ident
+        -- name = name' <> "."
         ret = let ed = entityDef $ getEntityVal $ return expr
               in (process ed, mempty)
+  -- sqlSelectCols subquery info expr@(EAlias i entI) = 
+  --   -- TODO: Implement this...
+  --   (name , mempty)
+
+  --   where
+  --       name' = useIdent info i
+  --       name = name' <> "."
+    
   sqlSelectColCount = entityColumnCount . entityDef . getEntityVal
   sqlSelectProcessRow = parseEntityValues ed
     where ed = entityDef $ getEntityVal (Proxy :: Proxy (SqlExpr (Entity a)))
@@ -1357,24 +1397,37 @@ instance PersistEntity a => SqlSelect (SqlExpr (Maybe (Entity a))) (Maybe (Entit
     | all (== PersistNull) cols = return Nothing
     | otherwise                 = Just <$> sqlSelectProcessRow cols
 
+instance PersistField a => SqlSelect (SqlExpr (Alias (Value a))) (Alias (Value a)) where
+  sqlSelectCols subquery info (EAlias i e) = first (asM True $ useIdent info i) $ sqlSelectCols subquery info e
 
 -- | You may return any single value (i.e. a single column) from
 -- a 'select' query.
 instance PersistField a => SqlSelect (SqlExpr (Value a)) (Value a) where
-  sqlSelectCols _ = materializeExpr
+  sqlSelectCols = materializeExpr
   sqlSelectColCount = const 1
   sqlSelectProcessRow [pv] = Value <$> fromPersistValue pv
   sqlSelectProcessRow pvs  = Value <$> fromPersistValue (PersistList pvs)
 
+-- builderToUniqueAlias b = "TODOUNIQUEALIAS" -- b -- TODO XXX
+-- -- Hash the builder?
+-- -- Doesn't work if the same expr appears multiple times... 
 
 -- | Materialize a @SqlExpr (Value a)@.
-materializeExpr :: IdentInfo -> SqlExpr (Value a) -> (TLB.Builder, [PersistValue])
-materializeExpr info (ERaw p f) =
-  let (b, vals) = f info
-  in (parensM p b, vals)
-materializeExpr info (ECompositeKey f) =
-  let bs = f info
-  in (uncommas $ map (parensM Parens) bs, [])
+materializeExpr :: Bool -> IdentInfo -> SqlExpr (Value a) -> (TLB.Builder, [PersistValue])
+materializeExpr subquery info (ERaw p f) =
+  f info
+  -- let (b, vals) = f info in
+  -- let alias = builderToUniqueAlias b in
+  -- (asM subquery alias $ parensM p b, vals)
+materializeExpr subquery info (ECompositeKey f) =
+  let bs = f info in
+  (uncommas bs, [])
+  -- (uncommas $ map (\b -> asM subquery (builderToUniqueAlias b) $ parensM Parens b) bs, [])
+materializeExpr subquery info (ESub i vI) = 
+  (useIdent info i <> "." <> useIdent info vI, [])
+-- materializeExpr subquery info (EAlias i vI) = 
+--   (useIdent info i <> "." <> useIdent info vI, [])
+--   -- TODO: Implement this... XXX
 
 
 -- | You may return tuples (up to 16-tuples) and tuples of tuples
@@ -1908,9 +1961,44 @@ over valE partitionM orders = ERaw Never $ \info ->
 --     r
 
 
+class ToAliasedExpr a where
+    toAliasedExpr :: a -> Ident -> a
+
+instance ToAliasedExpr (SqlExpr a) where
+    toAliasedExpr (EAlias vI _) i  = ESub i vI
+    toAliasedExpr (EValue vI) i    = ESub i vI
+    toAliasedExpr (EEntity _ eI) i = EEntity (Just i) eI
+    toAliasedExpr (EMaybe e) i     = EMaybe $ toAliasedExpr e i
+    toAliasedExpr (ESub _ vI) i    = ESub i vI
+    toAliasedExpr e@(ERaw _ _) _   = error "unreachable"
+    toAliasedExpr x _              = x -- JP: Not sure about the rest of the exprs.
+
+instance (ToAliasedExpr a, ToAliasedExpr b) => ToAliasedExpr (a,b) where
+    toAliasedExpr (a,b) i  = (
+        toAliasedExpr a i
+      , toAliasedExpr b i
+      ) 
+
+instance (ToAliasedExpr a, ToAliasedExpr b, ToAliasedExpr c) => ToAliasedExpr (a,b,c) where
+    toAliasedExpr (a,b,c) i  = (
+        toAliasedExpr a i
+      , toAliasedExpr b i
+      , toAliasedExpr c i
+      ) 
+
+instance (ToAliasedExpr a, ToAliasedExpr b, ToAliasedExpr c, ToAliasedExpr d) => ToAliasedExpr (a,b,c,d) where
+    toAliasedExpr (a,b,c,d) i  = (
+        toAliasedExpr a i
+      , toAliasedExpr b i
+      , toAliasedExpr c i
+      , toAliasedExpr d i
+      ) 
+
 -- fromSubSelect :: From query expr backend a => query a -> (a -> query b) -> query b
 -- :: (SqlSelect a r, BackendCompatible SqlBackend backend)
-fromSubSelect :: (SqlSelect a r, From SqlQuery SqlExpr SqlBackend a) => SqlQuery a -> (a -> SqlQuery b) -> SqlQuery b
+-- , From SqlQuery SqlExpr SqlBackend a 
+-- JP: Are we actually using the From constraint? XXX
+fromSubSelect :: (SqlSelect a r, ToAliasedExpr a, From SqlQuery SqlExpr SqlBackend a) => SqlQuery a -> (a -> SqlQuery b) -> SqlQuery b
 fromSubSelect subquery f = do
     -- Get SQL from sub query.
     initialIdentState <- Q $ lift S.get
@@ -1922,18 +2010,32 @@ fromSubSelect subquery f = do
     -- let (sql, vals) = toRawSql SELECT info sub
 
     -- Insert into select statement, built from current query.
-    res <- f $ toSubExpr ret
-
-    -- TODO: How do we put sd into query?
     subIdent <- newIdent "sub"
+    res <- f $ toAliasedExpr ret subIdent
+
+    -- Make subquery from clause.
+    -- JP: Does it matter what order we call this in?
     Q $ W.tell mempty { sdFromClause = [SubQuery subIdent (\info -> makeRawSql info (SELECT True) ret sd)]}
     -- Q $ W.tell mempty { sd}
 
     return res
 
-    where
-        -- toSubExpr x@(EValue _) = x
-        toSubExpr x = x
+    -- where
+    --     TODO: Make this a typeclass XXX
+    --     -- toSubExpr x@(EValue _) = x
+    --     toSubExpr x i = x `As` i
 
 
-    
+-- Remove value From?
+-- newtype Alias a = Alias Ident a
+-- data Alias a
+
+as :: SqlExpr (Value a) -> SqlQuery (SqlExpr (Alias (Value a)))
+as e = do
+    ident <- newIdent "v"
+    return $ EAlias ident e
+
+-- Add to typeclass?
+fromAlias :: SqlExpr (Alias a) -> SqlExpr a
+fromAlias (EAlias i e) = e
+fromAlias (ESub i vI) = ESub i vI
