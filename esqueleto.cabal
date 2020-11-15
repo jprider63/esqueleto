@@ -1,8 +1,10 @@
--- This file has been generated from package.yaml by hpack version 0.20.0.
+cabal-version: 1.12
+
+-- This file has been generated from package.yaml by hpack version 0.33.0.
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: 34b1b8836c9ae7acb038d0e808674ddb4c2ab696d37e5b117f61acad02ed6daf
+-- hash: 9078a6d7238c576c81bd5b91b41a8d6a7d051ef19e2ee12ced4b2457bab2d45b
 
 name:           esqueleto
 version:        2.6.0
@@ -22,7 +24,6 @@ copyright:      (c) 2012-2016 Felipe Almeida Lessa
 license:        BSD3
 license-file:   LICENSE
 build-type:     Simple
-cabal-version:  >= 1.10
 
 source-repository head
   type: git
